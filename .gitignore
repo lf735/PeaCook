@@ -1,0 +1,7 @@
+.venv/
+out/
+tests/external/
+.peacook_cache/
+__pycache__/
+*.egg-info/
+.pytest_cache/
