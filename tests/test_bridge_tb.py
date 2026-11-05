@@ -161,3 +161,109 @@ def test_compact_json_views(res):
     conns = jsonviews.connections(res.arch)["connections"]
     assert all({"from", "to", "protocol"} <= set(c) for c in conns)
     assert "producers" in jsonviews.dataflow(res.arch)["transactions"][0]
+
+
+# ----------------------------------------------------------------- relations (étape 1)
+def rels(env, kind):
+    return [r for r in env["relations"] if r["kind"] == kind]
+
+
+def short(x):
+    if not x["inst"].startswith("inst:"):
+        return x["inst"]
+    p = x["inst"].split(":", 1)[1]
+    if p == "uvm_test_top":
+        return "TEST"
+    return p.replace("uvm_test_top.", "")
+
+
+def test_relation_kinds_present(env):
+    kinds = {r["kind"] for r in env["relations"]}
+    assert {"tlm", "hier", "seq", "vif", "cfg", "handle"} <= kinds
+    assert all(set(r["states"]) == set(env["tests"]) for r in env["relations"])
+
+
+def test_tlm_relations_hide_dead_end_promoted_port(env):
+    pairs = {(short(r["src"]), short(r["dst"])) for r in rels(env, "tlm")}
+    assert ("env.in_agt.mon", "env.in_agt") not in pairs               # port promu sans suite
+    assert ("env.in_agt.mon", "env.ref_model.in_fifo") in pairs
+    # ... mais il reste visible dans le calque des ports promus
+    hier = {(short(r["src"]), short(r["dst"])) for r in rels(env, "hier")}
+    assert ("env.in_agt.mon", "env.in_agt") in hier
+    assert len(rels(env, "hier")) == len(env["connections"])
+
+
+def test_fifo_consumption_relation(env):
+    r = [r for r in rels(env, "tlm") if r["implicit"]]
+    assert [(short(x["src"]), short(x["dst"])) for x in r] == [("env.ref_model.in_fifo", "env.ref_model")]
+
+
+def test_sequence_relations(env):
+    seq = {(short(r["src"]), short(r["dst"]), r["label"]): r for r in rels(env, "seq")}
+    assert ("TEST", "env.vseqr", "bridge_smoke_vseq") in seq
+    assert ("env.vseqr", "env.apb_agt.sqr", "apb_cfg_seq") in seq
+    assert ("env.vseqr", "env.in_agt.sqr", "stream_seq") in seq
+    apb = seq[("env.vseqr", "env.apb_agt.sqr", "apb_cfg_seq")]
+    assert apb["states"]["bridge_smoke_test"] and not apb["states"]["bridge_passive_test"]   # sqr passif => grisé
+    assert not apb["states"]["bridge_base_test"]                       # séquence lancée seulement par les tests dérivés
+
+
+def test_vif_and_dut_relations(env):
+    vif = {(r["src"]["inst"], short(r["dst"]), r["label"]) for r in rels(env, "vif")}
+    assert ("if:apb_vif", "env.apb_agt.mon", "vif") in vif
+    assert ("if:apb_vif", "env.apb_agt.drv", "vif") in vif
+    assert ("if:in_vif", "env.in_agt.mon", "vif") in vif
+    assert any(s == "if:apb_vif" and d == "dut:dut" for s, d, _ in vif)
+    names = {n["id"]: n["kind"] for n in env["harness_nodes"]}
+    assert names["if:apb_vif"] == "interface" and names["dut:dut"] == "dut"
+
+
+def test_config_relations_exclude_vif_and_follow_state(env):
+    cfg = {(short(r["src"]), short(r["dst"]), r["label"]): r for r in rels(env, "cfg")}
+    assert ("TEST", "env", "cfg") in cfg
+    assert ("TEST", "env.apb_agt", "cfg") in cfg
+    assert not any(l == "vif" for _, _, l in cfg)
+    assert cfg[("TEST", "env.apb_agt", "cfg")]["states"]["bridge_smoke_test"]
+
+
+def test_handle_relations(env):
+    h = {(short(r["src"]), short(r["dst"]), r["label"]) for r in rels(env, "handle")}
+    assert ("env.vseqr", "env.apb_agt.sqr", "apb_sqr") in h
+
+
+def test_default_sequence_relation_via_config_db(env):
+    r = [x for x in rels(env, "seq") if x["label"] == "stream_seq (default)"]
+    assert [(short(x["src"]), short(x["dst"])) for x in r] == [("TEST", "env.in_agt.sqr")]
+    st = r[0]["states"]
+    assert st["bridge_err_test"] and not st["bridge_smoke_test"]
+
+
+def test_html_embedded_elk_and_offline(res):
+    page = html.build(res.arch, res.impl)
+    # Vérification stricte hors ligne (zéro dépendance CDN / HTTP distante)
+    assert "http://" not in page.replace("http://www.w3.org/2000/svg", "")
+    assert "https://" not in page
+    # Présence d'ELK.js embarqué dans la page
+    assert "new ELK()" in page
+    assert "elk.bundled" in page or "ELK" in page
+    data = json.loads(page.split('type="application/json">')[1].split("</script>")[0])
+    assert "relations" in data and len(data["relations"]) >= 50
+    assert "harness" in data and len(data["harness"]) >= 5
+
+
+def test_html_elk_layout_execution_headless(res, tmp_path):
+    import subprocess, shutil
+    edge = shutil.which("msedge") or r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+    if not Path(edge).exists():
+        pytest.skip("msedge introuvable pour test headless")
+    page = html.build(res.arch, res.impl)
+    p = tmp_path / "elk_view.html"
+    p.write_text(page, encoding="utf-8")
+    cmd = [edge, "--headless", "--disable-gpu", "--dump-dom", f"file:///{p.resolve().as_posix()}"]
+    run = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=25)
+    assert run.returncode == 0
+    assert 'id="layer-edges"' in run.stdout
+    assert 'id="layer-leaves"' in run.stdout
+    assert 'class="edge-path"' in run.stdout
+    assert "JS ERROR" not in run.stdout
+

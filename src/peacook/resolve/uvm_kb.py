@@ -55,7 +55,7 @@ ROLE_COLORS = {
     "test": "#e8d5f5", "env": "#d5e8f5", "agent": "#d5f5e3", "driver": "#fdebd0", "monitor": "#fcf3cf",
     "sequencer": "#fadbd8", "virtual_sequencer": "#f5b7b1", "scoreboard": "#d6eaf8", "subscriber": "#e8f8f5",
     "predictor": "#e8f8f5", "fifo": "#f2f3f4", "component": "#ececec", "reg_block": "#ebdef0",
-    "reg_adapter": "#ebdef0", "ref_model": "#d1f2eb", "dut": "#fdfefe", "interface": "#fef9e7",
+    "reg_adapter": "#ebdef0", "ref_model": "#d1f2eb", "dut": "#d1c4e9", "interface": "#e0f2f1",
     "sequence": "#fef5e7", "virtual_sequence": "#fdebd0", "seq_item": "#f8f9f9", "object": "#f8f9f9",
     "config": "#f4ecf7", "callback": "#f8f9f9",
 }

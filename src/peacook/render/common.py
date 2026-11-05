@@ -9,7 +9,15 @@ ROLE_ORDER = ["test", "env", "reg_block", "agent", "virtual_sequencer", "sequenc
               "ref_model", "predictor", "scoreboard", "subscriber", "fifo", "component"]
 INACTIVE = {"fill": "#f0f0f0", "stroke": "#bdbdbd", "font": "#9e9e9e"}
 COND_STROKE = "#d35400"
-PROTO_COLOR = {"analysis": "#2471a3", "seq_item": "#ca6f1e", "handle": "#7d3c98"}
+PROTO_COLOR = {
+    "analysis": "#2471a3",
+    "seq_item": "#ca6f1e",
+    "handle": "#7d3c98",
+    "vif": "#8e44ad",
+    "seq": "#27ae60",
+    "cfg": "#16a085",
+    "get_peek": "#2980b9",
+}
 
 
 def color_of(role: str) -> str:

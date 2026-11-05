@@ -8,7 +8,7 @@ from .. import __version__
 from ..resolve.values import glob_match
 from ..elaborate.topology import Topology
 from ..extract import textutil as tu
-from ..extract.facts import Facts
+from ..extract.facts import Facts, PHASE_METHODS
 from ..resolve import uvm_kb as kb
 from ..resolve.types import TypeModel, base_name
 
@@ -281,9 +281,10 @@ def _resolve_on(expr, on_path, top: Topology):
 def sequence_runs(top: Topology, tm: TypeModel, f: Facts) -> list[dict]:
     runs: list[dict] = []
 
-    def expand(seq_type, on_path, by, loc, depth, parent):
+    def expand(seq_type, on_path, by, loc, depth, parent, source):
         rid = len(runs)
-        runs.append({"seq": seq_type, "on": on_path, "started_by": by, "loc": loc, "depth": depth, "parent": parent})
+        runs.append({"seq": seq_type, "on": on_path, "started_by": by, "loc": loc, "depth": depth, "parent": parent,
+                     "source": source})
         if depth >= 6 or seq_type not in f.classes:
             return
         types, starts = _body_info(tm, f, seq_type)
@@ -292,10 +293,10 @@ def sequence_runs(top: Topology, tm: TypeModel, f: Facts) -> list[dict]:
             if not st:
                 continue
             target = _resolve_on(s["on"], on_path, top)
-            expand(tm.resolve(st)[0], target, seq_type, s["loc"], depth + 1, rid)
+            expand(tm.resolve(st)[0], target, seq_type, s["loc"], depth + 1, rid, on_path)
 
     for s in top.starts:
-        expand(s["seq"], s["on"], s["by"], s["loc"], 0, None)
+        expand(s["seq"], s["on"], s["by"], s["loc"], 0, None, s["by"])
     return runs
 
 
@@ -307,7 +308,8 @@ def merge_sequences(topos, tm: TypeModel, f: Facts) -> list[dict]:
             rec = out.setdefault(key, {
                 "seq": cid(r["seq"]), "seq_name": r["seq"], "item": tm.txn_of_seq(r["seq"]),
                 "on": iid(r["on"]) if r["on"] else None, "started_by": iid(r["started_by"]) if r["started_by"] in top.insts
-                else cid(r["started_by"]), "loc": r["loc"], "depth": r["depth"], "tests": []})
+                else cid(r["started_by"]), "source_inst": iid(r["source"]) if r["source"] else None,
+                "loc": r["loc"], "depth": r["depth"], "tests": []})
             if t not in rec["tests"]:
                 rec["tests"].append(t)
     return list(out.values())
@@ -375,3 +377,115 @@ def implementation(f: Facts, tm: TypeModel) -> dict:
                                 "on": s["on"], "via": s["via"], "loc": s["loc"]} for s in body[1]] if body else [],
         })
     return {"schema_version": SCHEMA_VERSION, "tool": {"name": "peacook", "version": __version__}, "classes": classes}
+
+
+# ----------------------------------------------------------------- relations
+RELATION_KINDS = ("tlm", "hier", "seq", "vif", "cfg", "handle")
+
+
+def relations(env: dict, har: dict, tm: TypeModel, f: Facts) -> tuple[list[dict], list[dict]]:
+    """Graphe de relations typées (calques du viewer) + nœuds du harnais (interfaces, DUT).
+
+    Chaque relation : {id, kind, src{inst,port}, dst{inst,port}, label, protocol, txn, implicit, loc, states{test: bool}}.
+    """
+    tests = env["tests"]
+    by = {i["id"]: i for i in env["instances"]}
+    rels: list[dict] = []
+    nodes: list[dict] = []
+
+    def ok(node_id: str, t: str) -> bool:
+        i = by.get(node_id)
+        return bool(i["states"][t]["active"]) if i else True
+
+    def add(kind, src, dst, label="", protocol=None, txn=None, states=None, loc=None, implicit=False):
+        if states is None:
+            states = {t: ok(src["inst"], t) and ok(dst["inst"], t) for t in tests}
+        rels.append({"id": f"rel:{kind}:{len(rels)}", "kind": kind, "src": src, "dst": dst, "label": label,
+                     "protocol": protocol or kind, "txn": txn, "implicit": implicit, "loc": loc, "states": states})
+
+    # tlm de bout en bout : on masque les liens qui se terminent sur un port promu d'un ancêtre sans suite
+    for c in env["flat_connections"]:
+        s, d = c["from"]["inst"], c["to"]["inst"]
+        if s in by and d in by and by[s]["path"].startswith(by[d]["path"] + "."):
+            continue
+        add("tlm", c["from"], c["to"], c["txn"] or c["protocol"], c["protocol"], c["txn"], dict(c["states"]))
+    # connexions brutes (ports promus)
+    for c in env["connections"]:
+        add("hier", c["src"], c["dst"], c["txn"] or c["protocol"], c["protocol"], c["txn"], dict(c["states"]),
+            c.get("loc"))
+    # handles de séquenceurs
+    for l in env["handle_links"]:
+        add("handle", {"inst": l["owner"], "port": l["handle"]}, {"inst": l["target"], "port": None}, l["handle"],
+            "handle", None, dict(l["states"]))
+    # séquences : instance d'exécution de la séquence parente -> séquenceur cible
+    for r in env["sequences"]:
+        src = r.get("source_inst") or (r["started_by"] if r["started_by"].startswith("inst:") else None)
+        if not src or not r["on"] or src not in by or r["on"] not in by or src == r["on"]:
+            continue
+        st = {t: (t in r["tests"]) and ok(src, t) and ok(r["on"], t) for t in tests}
+        add("seq", {"inst": src, "port": None}, {"inst": r["on"], "port": None}, r["seq_name"], "seq", r["item"], st,
+            r["loc"])
+    # séquences lancées via config_db "default_sequence" (UBUS, etc.) : émetteur -> séquenceurs visés
+    seqrs = [i for i in env["instances"] if i["role"] in ("sequencer", "virtual_sequencer")]
+    seen_default: set[tuple] = set()
+    for s in env["config_db"]["sets"]:
+        if s["field"] != "default_sequence" or not s["setter"] or s["setter"] not in by:
+            continue
+        vals = [v for v in s["values"].values() if v]
+        m = re.match(r"^(\w+)::type_id::get|^(\w+)#\d+|^(\w+)$", vals[0]) if vals else None
+        seq_name = next((g for g in m.groups() if g), None) if m else None
+        pat = s["pattern"]
+        head, _, tail = pat.rpartition(".")
+        if head and tail in PHASE_METHODS | {"main_phase", "run_phase"}:
+            pat = head
+        if not seq_name or pat.endswith(".*") or pat == "*":
+            continue                                # chemin non résolu : on ne devine pas
+        for q in seqrs:
+            if not glob_match(pat, q["path"]) or (s["setter"], q["id"], seq_name) in seen_default:
+                continue
+            seen_default.add((s["setter"], q["id"], seq_name))
+            st = {t: (t in s["values"]) and ok(s["setter"], t) and ok(q["id"], t) for t in tests}
+            add("seq", {"inst": s["setter"], "port": None}, {"inst": q["id"], "port": None},
+                f"{seq_name} (default)", "seq", tm.txn_of_seq(seq_name), st, s["loc"])
+    # consommation implicite d'une FIFO par le composant qui l'a créée
+    for i in env["instances"]:
+        if i["role"] != "fifo" or not i["parent"] or i["parent"] not in by:
+            continue
+        parent = by[i["parent"]]
+        pat = re.compile(rf"^(?:this\.)?{re.escape(i['name'])}\.(get|peek|try_get|try_peek)$")
+        used = any(pat.match(c) for cn in tm.chain(parent["class"] or "") if cn in f.classes
+                   for m in f.classes[cn].methods.values() for c in m["calls"])
+        if used:
+            add("tlm", {"inst": i["id"], "port": "get_peek_export"}, {"inst": parent["id"], "port": None}, "get",
+                "get_peek", None, None, i["loc"], implicit=True)
+    # harnais : interfaces, DUT, vif
+    top = next((t for t in har["tops"] if t["vif_sets"] or t["interfaces"]), None)
+    if top:
+        for ifc in top["interfaces"]:
+            nodes.append({"id": f"if:{ifc['name']}", "kind": "interface", "name": ifc["name"], "type": ifc["type"],
+                          "signals": ifc["signals"][:40], "modports": ifc["modports"], "loc": ifc["loc"]})
+        for d in top["duts"]:
+            nodes.append({"id": f"dut:{d['name']}", "kind": "dut", "name": d["name"], "type": d["type"],
+                          "signals": [], "modports": [], "loc": d["loc"]})
+            for ifname in d["interfaces"]:
+                ports = [p for p, v in d["ports"].items() if v == ifname]
+                add("vif", {"inst": f"if:{ifname}", "port": None}, {"inst": f"dut:{d['name']}", "port": None},
+                    ", ".join(ports), "vif", None, {t: True for t in tests}, d["loc"])
+        for v in top["vif_sets"]:
+            if not v["interface_instance"]:
+                continue
+            for c in v["consumers"]:
+                if c in by:
+                    add("vif", {"inst": f"if:{v['interface_instance']}", "port": None}, {"inst": c, "port": None},
+                        v["field"], "vif", None, None, v["loc"])
+    # config_db : émetteur -> lecteurs (hors vif, déjà montrés par le calque harnais)
+    for s in env["config_db"]["sets"]:
+        if s["type"].startswith("virtual") or not s["setter"] or s["setter"] not in by:
+            continue
+        for c in s["consumers"]:
+            if c not in by or c == s["setter"]:
+                continue
+            st = {t: (t in s["values"]) and ok(s["setter"], t) and ok(c, t) for t in tests}
+            add("cfg", {"inst": s["setter"], "port": None}, {"inst": c, "port": None},
+                s["field"], "cfg", None, st, s["loc"])
+    return rels, nodes

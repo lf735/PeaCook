@@ -50,6 +50,9 @@ package bridge_tests_pkg;
     function void build_phase(uvm_phase phase);
       set_inst_override_by_type("env.in_agt.drv", stream_driver::get_type(), stream_err_driver::get_type());
       super.build_phase(phase);
+      // Séquence de fond sur le séquenceur de l'agent d'entrée (lancée via config_db)
+      uvm_config_db#(uvm_object_wrapper)::set(this, "env.in_agt.sqr.main_phase", "default_sequence",
+                                              stream_seq::type_id::get());
     endfunction
   endclass
 

@@ -64,6 +64,7 @@ def analyze(filelist=None, directory=None, incdirs=None, defines=None, exclude=N
         "environment": env,
     }
     arch["harness"] = build.harness(f, tm, env)
+    env["relations"], env["harness_nodes"] = build.relations(env, arch["harness"], tm, f)
     arch["diagnostics"] = run_checks(arch, f, tm, ss.diagnostics) + diags
     impl = build.implementation(f, tm) if with_impl else None
     return Result(arch, impl, f, tm, ss)
